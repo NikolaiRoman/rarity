@@ -17,10 +17,15 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
+import time
+import re
 import operator
 import logging
-from twisted.internet import reactor
+from twisted.internet import reactor, defer
+import twisted.web.client
 import libtorrent
+from rarity.utils import serialize_torrent_metainfo, \
+    serialize_torrent_status, serialize_torrent
 
 FORMAT = '%(asctime)-15s %(message)s'
 logging.basicConfig(format=FORMAT)
@@ -52,29 +57,6 @@ def maybe_handle(func):
         assert isinstance(infohash, str)
         return func(self, infohash, *args, **kwargs)
     return decorated
-
-def serialize_torrent_metainfo(handle):
-    torrent_info = handle.get_torrent_info()
-    return {
-            'name': handle.name(),
-            'pieces': torrent_info.num_pieces(),
-            'private': torrent_info.priv(),
-        }
-
-
-def serialize_torrent_status(handle):
-    status = handle.status()
-    return {
-            'paused': torrent.is_paused(),
-            'progress': status.progress,
-            'upload_rate': status.upload_rate,
-            'download_rate': status.download_rate
-        }
-
-def serialize_torrent(handle):
-    return dict(itertools.chain(
-        serialize_torrent_status(handle).iteritems(),
-        serialize_torrent_metainfo(handle).iteritems()))
 
 class Session(object):
     MONITOR_ALERTS = reduce(operator.or_, (
@@ -190,19 +172,22 @@ class Session(object):
                 self._ses.remove_torrent(torrent)
         return d
 
-    def find_torrents(self, regexp):
+    def _find_torrents_re(self, regexp):
         compose = lambda *fx: reduce(lambda f, g: lambda *args, **kwargs: f(g(*args, **kwargs)), fx)
+        print regexp
+        print map(libtorrent.torrent_handle.name, self._ses.get_torrents())
         regexp = re.compile(regexp)
-        get_torrent_key = lambda t: str(t.info_hash())
         torrent_filter = compose(regexp.match, libtorrent.torrent_handle.name)
-        torrents = filter(torrent_filter, self._ses.get_torrents())
-        return map(serialize_torrent, torrents)
+        return filter(torrent_filter, self._ses.get_torrents())
+
+    def find_torrents(self, regexp):
+        torrents = self._find_torrents_re(regexp)
+        get_torrent_key = lambda t: str(t.info_hash())
+        return dict((get_torrent_key(t), serialize_torrent(t)) for t in torrents)
 
     def torrent_metainfo(self):
         def get_torrent_key(torrent):
             return str(torrent.info_hash())
-        def get_torrent_data(torrent):
-            torrent_info = torrent.get_torrent_info()
         return dict((get_torrent_key(torrent), serialize_torrent_metainfo(torrent))
                 for torrent in self._ses.get_torrents())
 

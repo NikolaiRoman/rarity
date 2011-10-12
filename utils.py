@@ -17,6 +17,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
+import itertools
 
 def serialize_torrent_metainfo(handle):
     torrent_info = handle.get_torrent_info()
@@ -30,7 +31,7 @@ def serialize_torrent_metainfo(handle):
 def serialize_torrent_status(handle):
     status = handle.status()
     return {
-            'paused': torrent.is_paused(),
+            'paused': handle.is_paused(),
             'progress': status.progress,
             'upload_rate': status.upload_rate,
             'download_rate': status.download_rate
