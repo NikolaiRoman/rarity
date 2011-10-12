@@ -1,165 +1,87 @@
-import libtorrent as lt
+# Copyright (C) 2011 by Stacey Ell
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+import logging
+import libtorrent
 import time
 import operator
+import re
+import functools
+import itertools
 
 from twisted.internet import reactor
 from twisted.internet import defer
+from twisted.spread import pb
+import twisted.web.client
+import sshsimpleserver
 
-class TimeoutError(RuntimeError):
-    pass
+from discord.utils import serialize_torrent_metainfo, \
+        serialize_torrent_status, serialize_torrent
+from discord.session import Session
 
+FORMAT = '%(asctime)-15s %(message)s'
+logging.basicConfig(format=FORMAT)
+logger = logging.getLogger('ClientCore')
+logger.setLevel(logging.INFO)
 
-class AlertDeferred(defer.Deferred):
-    def __init__(self, match_func, expire_after=None):
-        self.match_func = match_func
-        self.created_at = time.time()
-        self.expire_after = expire_after or 600
-
-    def is_expired(self):
-        return (time.time() - self.created_at) > self.expire_after
-
-    def match(self, alert):
-        return self.match_func(alert)
-
-
-class Session(object):
-    MONITOR_ALERTS = reduce(operator.or_, (
-        lt.alert.category_t.error_notification,
-        lt.alert.category_t.status_notification,
-        lt.alert.category_t.storage_notification,
-        ))
-
-    def __init__(self):
-        self._ses = lt.session()
-        self._ses.set_alert_mask(self.MONITOR_ALERTS)
-        self._waiting_deferreds = set()
-        self._pop_alerts() # start alert popping loop
-        self._handles = dict()
-
-    def _pop_alerts(self):
-        try:
-            while True:
-                alert = self._ses.pop_alert()
-                if alert is None: break
-                self._process_alert(alert)
-        finally:
-            reactor.callLater(1, self._pop_alerts)
-
-    def _process_alert(self, alert):
-        print repr(alert.message())
-
-        for wd in self._waiting_deferreds:
-            if wd.matches(alert):
-                wd.deferred.callback(alert)
-                self._waiting_deferreds.remove(wd)
-
-    def _expire_deferreds(self):
-        for wd in self._waiting_deferreds:
-            if wd.is_expired():
-                wd.deferred.errback(TimeoutError("The callback expired."))
-                self._waiting_deferreds.remove(wd)
-
-    def _add_deferred(self, func):
-        ad = AlertDeferred(alert_match_func)
-        self._waiting_deferreds.add(ad)
-        return ad
-
-    def add_torrent(self, url):
-        """
-        returns Deferred.  callback arg is a torrent handle.
-        """
-        deferred = defer.Deferred()
-        def add_torrent(buf):
-            info = lt.torrent_info(lt.bdecode(buf))
-            deferred.callback(self._ses.add_torrent(info, "/tmp"))
-        libsre.twisted.http.buf_get(url).addBoth(add_torrent, deferred.errback)
-        return deferred
-
-    # @derpderp # : args=(self, handle) -> args=(self, infohash)
-    def resume_torrent(self, handle):
-        """
-        returns a Deferred.  callback arg is a libtorrent.torrent_resumed_alert
-        """
-        infohash = str(handle.info_hash())
-        def alert_match_func(alert):
-            if isinstance(alert, lt.torrent_resumed_alert):
-                return infohash == str(alert.handle.info_hash)
-            return False
-        return self._add_deferred(alert_match_func)
-
-    # @derpderp # : args=(self, handle) -> args=(self, infohash)
-    def pause_torrent(self, handle):
-        """
-        returns a Deferred.  callback arg is a libtorrent.torrent_paused_alert
-        """
-        infohash = str(handle.info_hash())
-        def alert_match_func(alert):
-            if isinstance(alert, lt.torrent_paused_alert):
-                return infohash == str(alert.handle.info_hash)
-            return False
-        return self._add_deferred(alert_match_func)
-
-    # @derpderp # : args=(self, handle) -> args=(self, infohash)
-    def remove_torrent(self, handle):
-        """
-        returns a Deferred.  callback arg is a libtorrent.???
-        """
-        infohash = str(handle.info_hash())
-        def alert_match_func(alert):
-            if isinstance(alert, None):
-                return infohash == str(alert.handle.info_hash)
-            return False
-        return self._add_deferred(alert_match_func)
-
-    def torrent_metainfo(self):
-        def get_torrent_key(torrent):
-            return str(torrent.info_hash())
-        def get_torrent_data(torrent):
-            torrent_info = torrent.get_torrent_info()
-            return {
-                    'name': torrent.name(),
-                    'pieces': torrent_info.num_pieces(),
-                    'private': torrent_info.priv(),
-                }
-        return dict((get_torrent_key(torrent), get_torrent_data(torrent))
-                for torrent in self._ses.get_torrents())
-
-    def torrent_state(self):
-        def get_torrent_key(torrent):
-            return str(torrent.info_hash())
-        def get_torrent_data(torrent):
-            status = torrent.status()
-            return {
-                    'name': torrent.name(),
-                    'paused': torrent.is_paused(),
-                    'progress': status.progress,
-                    'upload_rate': status.upload_rate,
-                    'download_rate': status.download_rate
-                    }
-        return dict( (get_torrent_key(torrent), get_torrent_data(torrent))
-                for torrent in self._ses.get_torrents())
-            (torrent, dict(name=torrent.name()))
-
+def alert_to_infohash(func):
+    def decorated(*args, **kwargs):
+        d = defer.Deferred()
+        def convert(item):
+            d.callback(str(item.handle.info_hash()))
+        tmp = func(*args, **kwargs)
+        tmp.addCallbacks(convert, d.errback)
+        return d
+    return decorated
 
 class ClientRemote(pb.Root):
     def __init__(self, session):
         self.session = session
 
+    @alert_to_infohash
     def remote_add_torrent(self, url):
         return self.session.add_torrent(url)
 
+    @alert_to_infohash
     def remote_pause_torrent(self, infohash):
-        # FIXME: signature mismatch
         return self.session.pause_torrent(infohash)
 
+    @alert_to_infohash
     def remote_resume_torrent(self, infohash):
-        # FIXME: signature mismatch
         return self.session.resume_torrent(infohash)
 
+    @alert_to_infohash
     def remote_remove_torrent(self, infohash):
-        # FIXME: signature mismatch
         return self.session.remove_torrent(infohash)
 
+    @alert_to_infohash
+    def remote_get_torrent_info(self, infohash):
+        return self.session.torrent_state()[infohash]
+
+    def remote_find_torrent(self, regexp):
+        return self.session.find_torrents(regexp)
+
+    def remote_get_torrent_name(self, infohash):
+        tmp = self.session.torrent_state()
+        logger.info(repr(tmp))
+        return tmp[infohash]['name']
 
 session = Session()
 session._ses.listen_on(23866, 23866)
@@ -167,26 +89,32 @@ session._ses.add_dht_router('router.bittorrent.com', 6881)
 session._ses.load_country_db('/home/sell/dev/dht_overlord/GeoIP.dat')
 session._ses.start_lsd()
 
-
-reactor.start()
-
 try:
     with open('/tmp/dht-info.b', 'r') as f:
-        session._ses.start_dht(lt.bdecode(f.read()))
+        info = libtorrent.bdecode(f.read())
+        session._ses.start_dht(info)
+        logger.info("started DHT with %d nodes" % len(info['nodes']))
 except IOError:
     session._ses.start_dht({})
+    logger.info("started DHT without any nodes.")
 
-while True:
+def write_dht_info():
     with open('/tmp/dht-info.b', 'w') as f:
-        f.write(lt.bencode(ses.dht_state()))
-    try:
-        time.sleep(300)
-    except KeyboardInterrupt:
-        with open('/tmp/dht-info.b', 'w') as f:
-            f.write(lt.bencode(ses.dht_state()))
-        print "wrote. exiting."
-        break
+        f.write(libtorrent.bencode(session._ses.dht_state()))
+        logger.info("Wrote DHT info")
+    reactor.callLater(60, write_dht_info)
 
+reactor.callLater(120, write_dht_info)
+reactor.listenTCP(8800, pb.PBServerFactory(ClientRemote(session)))
 
+reactor.listenTCP(5022, sshsimpleserver.getManholeFactory({
+        'session': session,
+        'libtorrent': libtorrent,
+    }, sell='dicks'))
 
+reactor.run()
+
+with open('/tmp/dht-info.b', 'w') as f:
+    f.write(libtorrent.bencode(session._ses.dht_state()))
+    logger.info("Wrote DHT info")
 
