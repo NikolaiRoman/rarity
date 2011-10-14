@@ -51,7 +51,7 @@ def alert_to_infohash(func):
         return d
     return decorated
 
-# View 
+# View
 class ClientRemote(pb.Root):
     def __init__(self, session):
         self.session = session
@@ -111,7 +111,6 @@ def write_dht_info():
 
 reactor.callLater(120, write_dht_info)
 reactor.listenTCP(8800, pb.PBServerFactory(ClientRemote(session)))
-
 reactor.listenTCP(5022, sshsimpleserver.getManholeFactory({
         'session': session,
         'libtorrent': libtorrent,

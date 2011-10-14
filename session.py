@@ -17,6 +17,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
+import sys
+sys.path.append('/home/sell/dev/libsre/src')
+
+import libsre.python.functools as sre_ft
 import time
 import re
 import operator
@@ -36,20 +40,54 @@ logger.setLevel(logging.INFO)
 class TimeoutError(RuntimeError):
     pass
 
+import os
+class ResumeStorage(object):
+    def __init__(self, basepath):
+        self._basepath = basepath
 
-class AlertDeferred(object):
-    def __init__(self, match_func, expire_after=None):
+    def __setitem__(self, infohash, entry):
+        return self.get_saver(infohash)(entry)
+
+    def get_saver(self, infohash):
+        def saver(entry):
+            ih = str(infohash)
+            with open(os.path.join(self._basepath, ih), 'w') as f:
+                f.write(libtorrent.bencode(entry))
+        return saver
+
+    def __getitem__(self, infohash):
+        infohash = str(infohash)
+        with open(os.path.join(self._basepath, infohash), 'r') as f:
+            return libtorrent.bdecode(f.read())
+
+class IStaticAlertHandler(object): pass # interface
+
+class AbstractAlertDeferred(object):
+    def __init__(self, match_func):
         self.match_func = match_func
-        self.created_at = time.time()
-        self.expire_after = expire_after or 600
         self.deferred = defer.Deferred()
-
-    def is_expired(self):
-        return (time.time() - self.created_at) > self.expire_after
 
     def match(self, alert):
         return self.match_func(alert)
 
+class AlertDeferred(AbstractAlertDeferred):
+    def __init__(self, match_func, expire_after=None):
+        super(AlertDeferred, self).__init__(match_func)
+        self.created_at = time.time()
+        self.expire_after = expire_after or 600
+
+    def is_expired(self):
+        return (time.time() - self.created_at) > self.expire_after
+
+def signature_match(*sig_args):
+    def decorator(func):
+        def decorated(*f_args):
+            if not reduce(operator.and_, (
+                    isinstance(a, b) for (a, b) in zip(f_args, sig_args))):
+                return False
+            return func(*f_args)
+        return decorated
+    return decorator
 
 def maybe_handle(func):
     def decorated(self, infohash, *args, **kwargs):
@@ -69,10 +107,14 @@ class Session(object):
         ))
 
     def __init__(self):
+        self._waiting_deferreds = list()
+        self._static_alert_handlers = list()
+        self._add_static_handlers()
+
         self._ses = libtorrent.session()
         self._ses.set_alert_mask(self.MONITOR_ALERTS)
-        self._waiting_deferreds = list()
         self._pop_alerts() # start alert popping loop
+        self._resume_storage = ResumeStorage("/tmp/resume")
 
     def _pop_alerts(self):
         try:
@@ -85,6 +127,9 @@ class Session(object):
 
     def _process_alert(self, alert):
         logger.info("%s: %s" % (type(alert), alert.message()))
+        for sah in self._static_alert_handlers:
+            sah(alert)
+
         for wd in self._waiting_deferreds:
             if wd.match(alert):
                 wd.deferred.callback(alert)
@@ -100,6 +145,33 @@ class Session(object):
         ad = AlertDeferred(alert_match_func)
         self._waiting_deferreds.append(ad)
         return ad.deferred
+
+    def add_static_handler(self):
+        def decorator(func):
+            self._static_alert_handlers.append(func)
+            return func
+        return decorator
+
+    def _add_static_handlers(self):
+        @self.add_static_handler()
+        @signature_match(libtorrent.save_resume_data_alert)
+        def save_resume_handler(alert):
+            self._resume_storage[alert.handle.info_hash()] = alert.resume_data
+
+        @self.add_static_handler()
+        @signature_match(libtorrent.torrent_paused_alert)
+        def save_resume_data_on_pause(alert):
+            alert.handle.save_resume_data()
+
+    def _make_torrent_alert_handler(self, infohash, alert_cls):
+        """
+        returns a Deferred.  callback arg is a alert_cls
+        """
+        def alert_match_func(alert):
+            if isinstance(alert, alert_cls):
+                return infohash == str(alert.handle.info_hash())
+            return False
+        return self._add_deferred(alert_match_func)
 
     def add_torrent(self, url):
         """
@@ -125,64 +197,57 @@ class Session(object):
         twisted.web.client.getPage(url).addCallbacks(_add_torrent, deferred.errback)
         return deferred
 
+    def load_torrent(self, infohash):
+        d = self._make_torrent_alert_handler(infohash, (
+                # libtorrent.torrent_loaded_alert,
+                type('AnonymousType', (object, ), {}),
+            ))
+        handle = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
+        try:
+            handle.infohash()
+        except RuntimeError as e:
+            d.errback(failure.Failure(ValueError("Invalid handle")))
+
+        if infohash not in self._metainfo_torrent:
+            d.errback(failure.Failure(ValueError("Unknown infohash")))
+        else:
+            if infohash in self._resume_storage:
+                pass
+        return d
+
     @maybe_handle # : args=(self, infohash | handle) -> args=(self, infohash)
     def resume_torrent(self, infohash):
         """
         returns a Deferred.  callback arg is a libtorrent.torrent_resumed_alert
         """
-        def alert_match_func(alert):
-            if isinstance(alert, libtorrent.torrent_resumed_alert):
-                return infohash == str(alert.handle.info_hash())
-            return False
-        d = self._add_deferred(alert_match_func)
-        try:
-            torrent = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
-            torrent.resume()
-        except Exception as e:
-            d.errback(failure.Failure(e))
-        return d
+        retval = self._make_torrent_alert_handler(infohash, libtorrent.torrent_resumed_alert)
+        torrent = self._ses.find_torrent(libtorrent.big_number(infohash.encode('hex')))
+        torrent.resume()
+        return retval
 
     @maybe_handle # : args=(self, infohash | handle) -> args=(self, infohash)
     def pause_torrent(self, infohash):
         """
         returns a Deferred.  callback arg is a libtorrent.torrent_paused_alert
         """
-        def alert_match_func(alert):
-            if isinstance(alert, libtorrent.torrent_paused_alert):
-                return infohash == str(alert.handle.info_hash())
-            return False
-        d = self._add_deferred(alert_match_func)
-        try:
-            torrent = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
-            torrent.pause()
-        except Exception as e:
-            d.errback(failure.Failure(e))
-        return d
+        retval = self._make_torrent_alert_handler(infohash, libtorrent.torrent_paused_alert)
+        torrent = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
+        torrent.pause()
+        return retval
 
     @maybe_handle # : args=(self, infohash | handle) -> args=(self, infohash)
     def remove_torrent(self, infohash):
         """
         returns a Deferred.  callback arg is a libtorrent.torrent_deleted_alert
         """
-        def alert_match_func(alert):
-            if isinstance(alert, libtorrent.torrent_deleted_alert):
-                print "==(%s, %s)" % (repr(infohash), repr(str(alert.info_hash())))
-                return infohash == str(alert.info_hash())
-            return False
-        d = self._add_deferred(alert_match_func)
-        try:
-            torrent = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
-            self._ses.remove_torrent(torrent)
-        except Exception as e:
-            d.errback(failure.Failure(e))
-        return d
+        return self._make_torrent_alert_handler(
+                libtorrent.torrent_deleted_alert, lambda a: self._ses.remove_torrent(a.handle))
 
     def _find_torrents_re(self, regexp):
-        compose = lambda *fx: reduce(lambda f, g: lambda *args, **kwargs: f(g(*args, **kwargs)), fx)
         print regexp
         print map(libtorrent.torrent_handle.name, self._ses.get_torrents())
         regexp = re.compile(regexp)
-        torrent_filter = compose(regexp.match, libtorrent.torrent_handle.name)
+        torrent_filter = sre_ft.compose(regexp.match, libtorrent.torrent_handle.name)
         return filter(torrent_filter, self._ses.get_torrents())
 
     def find_torrents(self, regexp):
@@ -201,5 +266,8 @@ class Session(object):
             return str(torrent.info_hash())
         return dict( (get_torrent_key(torrent), serialize_torrent_status(torrent))
                 for torrent in self._ses.get_torrents())
+
+    def stop_session(self):
+        pass
 
 
