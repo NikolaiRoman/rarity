@@ -23,6 +23,7 @@ import random, datetime
 import time, sys
 from twisted.spread import pb
 import re
+import functools
 
 linkchannels = ['#', '#lolinano']
 
@@ -34,7 +35,7 @@ def parse_hostmask(hostmask):
     user, host = rest.split('@', 1)
     return nick, user, host
 
-class DiscordBot(irc.IRCClient):
+class RarityBot(irc.IRCClient):
     nickname = 'Rarity|nina'
 
     def connectionMade(self, *args, **kwargs):
@@ -110,16 +111,27 @@ class DiscordBot(irc.IRCClient):
         if torrent_start_re.match(message):
             args = torrent_start_re.match(message).groups()
             self._start_torrent(nick, channel, *args)
-
-
-class DiscordBotFactory(protocol.ClientFactory):
-    protocol = DiscordBot
+        pb_reconnect_re = re.compile('^' + re.escape(self.nickname+': pbreconnect'))
+        if pb_reconnect_re.match(message):
+            def reply(message):
+                self.say(channel, "%s: connected, %s" % (nick, message))
+            self.factory.connect().addCallback(reply)
+        
+class RarityBotFactory(protocol.ClientFactory):
+    protocol = RarityBot
 
     def __init__(self):
         self.session = None
+        self.connect = None
 
-    def set_session(self, session):
-        self.session = session
+    def connect_pb(self, factory, reactor_func):
+        d = defer.Deferred()
+        def set_session(session):
+            self.session = session
+            d.callback("Session attached: %s" % repr(session))
+        reactor_func(factory)
+        factory.getRootObject().addCallbacks(set_session, d.errback)
+        return d
 
     def clientConnectionFailed(self, connector, reason):
         print "connection failed:", reason
@@ -145,14 +157,11 @@ class DiscordBotFactory(protocol.ClientFactory):
         return self.session.callRemote("get_torrent_metainfo", infohash)
 
 if __name__ == '__main__':
-    def err(reason):
-        print reason
-        reactor.stop()
-    pbfactory = pb.PBClientFactory()
-    botfactory = DiscordBotFactory()
-    reactor.connectTCP("localhost", 8800, pbfactory)
+    botfactory = RarityBotFactory()
+    connector = functools.partial(botfactory.connect_pb, pb.PBClientFactory(), functools.partial(
+        reactor.connectTCP, "localhost", 8800))
+    botfactory.connect = connector
     reactor.connectTCP("10.0.12.6", 6667, botfactory)
-    pbfactory.getRootObject().addCallbacks(botfactory.set_session, err)
     reactor.run()
 
 
