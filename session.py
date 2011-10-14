@@ -23,6 +23,7 @@ import operator
 import logging
 from twisted.internet import reactor, defer
 import twisted.web.client
+from twisted.python import failure
 import libtorrent
 from rarity.utils import serialize_torrent_metainfo, \
     serialize_torrent_status, serialize_torrent
@@ -58,6 +59,7 @@ def maybe_handle(func):
         return func(self, infohash, *args, **kwargs)
     return decorated
 
+
 class Session(object):
     MONITOR_ALERTS = reduce(operator.or_, (
         libtorrent.alert.category_t.error_notification,
@@ -71,7 +73,6 @@ class Session(object):
         self._ses.set_alert_mask(self.MONITOR_ALERTS)
         self._waiting_deferreds = list()
         self._pop_alerts() # start alert popping loop
-        self._handles = dict() # infohash -> handle
 
     def _pop_alerts(self):
         try:
@@ -84,8 +85,6 @@ class Session(object):
 
     def _process_alert(self, alert):
         logger.info("%s: %s" % (type(alert), alert.message()))
-        # TODO: add torrent-added event to populate self._handles
-        # TODO: add torrent-removed event to reclaim entries in self._handles
         for wd in self._waiting_deferreds:
             if wd.match(alert):
                 wd.deferred.callback(alert)
@@ -136,9 +135,11 @@ class Session(object):
                 return infohash == str(alert.handle.info_hash())
             return False
         d = self._add_deferred(alert_match_func)
-        for torrent in self._ses.get_torrents():
-            if infohash == str(torrent.info_hash()):
-                torrent.resume()
+        try:
+            torrent = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
+            torrent.resume()
+        except Exception as e:
+            d.errback(failure.Failure(e))
         return d
 
     @maybe_handle # : args=(self, infohash | handle) -> args=(self, infohash)
@@ -151,9 +152,11 @@ class Session(object):
                 return infohash == str(alert.handle.info_hash())
             return False
         d = self._add_deferred(alert_match_func)
-        for torrent in self._ses.get_torrents():
-            if infohash == str(torrent.info_hash()):
-                torrent.pause()
+        try:
+            torrent = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
+            torrent.pause()
+        except Exception as e:
+            d.errback(failure.Failure(e))
         return d
 
     @maybe_handle # : args=(self, infohash | handle) -> args=(self, infohash)
@@ -167,9 +170,11 @@ class Session(object):
                 return infohash == str(alert.info_hash())
             return False
         d = self._add_deferred(alert_match_func)
-        for torrent in self._ses.get_torrents():
-            if infohash == str(torrent.info_hash()):
-                self._ses.remove_torrent(torrent)
+        try:
+            torrent = self._ses.find_torrent(libtorrent.big_number(infohash.decode('hex')))
+            self._ses.remove_torrent(torrent)
+        except Exception as e:
+            d.errback(failure.Failure(e))
         return d
 
     def _find_torrents_re(self, regexp):

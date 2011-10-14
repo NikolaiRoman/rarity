@@ -61,15 +61,15 @@ class DiscordBot(irc.IRCClient):
         self.factory.find_torrent(regexp).addCallbacks(reply_success, reply_error)
 
     def _start_torrent(self, nick, channel, regexp):
-        def reply_error(message): 
+        def reply_error(message):
             self.say(channel, "%s: Failed: %s" % (nick, message.getErrorMessage()))
         def reply_success(message):
             self.say(channel, "%s: started: %s" % (nick, fmt_torrent(message)))
         def torrent_start_success(infohash):
-            self.factory.get_torrent_metainfo(infohash).addCallback(reply_success)
+            self.factory.get_torrent_metainfo(infohash).addCallbacks(reply_success, reply_error)
         def get_torrents_success(torrents):
             for torrent_ih in torrents.keys():
-                self.factory.start_torrent(torrent_ih).addCallback(torrent_start_success)
+                self.factory.start_torrent(torrent_ih).addCallback(torrent_start_success, reply_error)
         self.factory.find_torrent(regexp).addCallbacks(get_torrents_success, reply_error)
 
     def _stop_torrent(self, nick, channel, regexp):
